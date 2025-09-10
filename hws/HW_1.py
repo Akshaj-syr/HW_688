@@ -4,13 +4,12 @@ import fitz
 
 
 # Show title and description.
-st.title("📄Lab 2")
+st.title("📄My Document question answering")
 st.write(
     "Upload a document below and ask a question about it – GPT will answer! "
     "To use this app, you need to provide an OpenAI API key, which you can get "
     "[here](https://platform.openai.com/account/api-keys)."
 )
-
 
 # Ask user for their OpenAI API key via `st.text_input`.
 openai_api_key = st.secrets["api_key"]
@@ -39,35 +38,18 @@ else:
             raise ValueError("No selectable text found in PDF (might be a scanned PDF).")
         return text
 
-st.sidebar.header("Summary Options")
-
-summary_style = st.sidebar.radio(
-    "Choose summary format:",
-    options=["100 words", "2 connecting paragraphs", "5 bullet points"],
-    index=0,
-    help="This controls how the model summarizes your document."
-)
-
-use_advanced = st.sidebar.checkbox(
-    "Use Advanced Model (GPT-4o)",
-    value=False,
-    help="Unchecked uses gpt-4o-mini (cheaper). Checked uses gpt-4o (higher quality)."
-)
-
-model_name = "gpt-4o" if use_advanced else "gpt-4o-mini"
-
     # Let the user upload a file via `st.file_uploader` +
-uploaded_file = st.file_uploader(
+    uploaded_file = st.file_uploader(
         "Upload a document (.txt or .pdf)",
         type=("txt", "pdf")
     )
 
     # If the file is removed from the UI, we must drop access to its data 
-if uploaded_file is None:
+    if uploaded_file is None:
         if st.session_state["document"] is not None:
             st.session_state["document"] = None
             st.session_state["uploaded_name"] = None
-else:
+    else:
         # Parse only when a new file is uploaded or the name changed
         if uploaded_file.name != st.session_state["uploaded_name"]:
             file_extension = uploaded_file.name.split('.')[-1].lower()
@@ -87,21 +69,21 @@ else:
                 st.stop()
 
     # Ask the user for a question via `st.text_area`.
-question = st.text_area(
+    question = st.text_area(
         "Now ask a question about the document!",
         placeholder='e.g., "Is this course hard?"',
         disabled=(st.session_state["document"] is None),
     )
 
     # 3c: Try 4 different models and show the model name before each answer
-models = [
+    models = [
         "gpt-3.5-turbo",
         "gpt-4.1",
         "gpt-5-chat-latest",
         "gpt-5-nano",
     ]
 
-if st.session_state["document"] and question:
+    if st.session_state["document"] and question:
         # Build the prompt once, reusing for all models
         messages = [
             {
