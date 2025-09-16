@@ -1,67 +1,170 @@
 import streamlit as st
+import requests
+import json
+from bs4 import BeautifulSoup
 from openai import OpenAI
-import os
+import google.generativeai as genai
 
-st.set_page_config(page_title="Lab 3")
+st.set_page_config(page_title="HW3 Chatbot")
 
-st.title("Lab 3: Chatbot")
+st.title("HW3 — Streaming Chatbot with URLs")
 
-# API key
-api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-if not api_key:
-    st.error("Missing API key")
-    st.stop()
+# -----------------------
+# Sidebar options
+# -----------------------
+url1 = st.sidebar.text_input("Enter first URL")
+url2 = st.sidebar.text_input("Enter second URL (optional)")
 
-client = OpenAI(api_key=api_key)
+provider = st.sidebar.selectbox(
+    "LLM provider",
+    ["OpenAI", "Google (Gemini)", "Mistral"],
+    index=0,
+)
 
-# Conversation history
+use_advanced = st.sidebar.checkbox("Use Advanced Model", value=False)
+
+memory_type = st.sidebar.radio(
+    "Conversation memory type",
+    ["Buffer (6 Qs)", "Summary", "Buffer (2000 tokens)"],
+    index=0,
+)
+
+# -----------------------
+# API Keys
+# -----------------------
+openai_key = st.secrets.get("OPENAI_API_KEY")
+gemini_key = st.secrets.get("GEMINI_API_KEY")
+mistral_key = st.secrets.get("MISTRAL_API_KEY")
+
+# -----------------------
+# Helpers
+# -----------------------
+def read_url_content(u: str) -> str:
+    try:
+        r = requests.get(u, timeout=20)
+        soup = BeautifulSoup(r.content, "html.parser")
+        return soup.get_text(separator="\n", strip=True)
+    except Exception as e:
+        return f"[Error fetching {u}: {e}]"
+
+def get_combined_context() -> str:
+    text1, text2 = "", ""
+    if url1:
+        text1 = read_url_content(url1)
+    if url2:
+        text2 = read_url_content(url2)
+    combined = text1 + "\n\n" + text2
+    return combined[:20000]  # safety cutoff
+
+# -----------------------
+# Memory handling
+# -----------------------
 if "chat" not in st.session_state:
     st.session_state.chat = [
-        {"role": "system", "content": "Explain things so a 10 year old can understand."}
+        {"role": "system", "content": "Explain things simply and clearly."}
     ]
-if "waiting_more" not in st.session_state:
-    st.session_state.waiting_more = False
+if "summary" not in st.session_state:
+    st.session_state.summary = ""
 
-# Show old messages
-for m in st.session_state.chat:
-    if m["role"] == "user":
-        with st.chat_message("user"):
-            st.write(m["content"])
-    elif m["role"] == "assistant":
-        with st.chat_message("assistant"):
-            st.write(m["content"])
+def apply_memory(msgs):
+    if memory_type == "Buffer (6 Qs)":
+        return msgs[-12:]  # user+assistant → 6 Q&A = 12 msgs
+    elif memory_type == "Summary":
+        return [
+            {"role": "system", "content": "Summary of conversation so far: " + st.session_state.summary}
+        ] + msgs[-2:]  # keep last exchange
+    elif memory_type == "Buffer (2000 tokens)":
+        # crude cutoff: ~4 chars/token → 8000 chars
+        total = ""
+        result = []
+        for m in reversed(msgs):
+            if len(total) + len(m["content"]) > 8000:
+                break
+            result.insert(0, m)
+            total += m["content"]
+        return result
+    return msgs
 
-# User input
-user_msg = st.chat_input("Type your question...")
-
-def ask_model(prompt):
-    st.session_state.chat.append({"role": "user", "content": prompt})
-    msgs = st.session_state.chat[-5:]  
+# -----------------------
+# LLM Functions
+# -----------------------
+def stream_openai(messages, advanced):
+    client = OpenAI(api_key=openai_key)
+    model = "gpt-4o" if advanced else "gpt-4o-mini"
     with st.chat_message("assistant"):
         text = ""
         spot = st.empty()
         for chunk in client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=msgs,
+            model=model,
+            messages=messages,
             stream=True,
         ):
             part = chunk.choices[0].delta.content or ""
             text += part
             spot.write(text)
-        st.session_state.chat.append({"role": "assistant", "content": text})
-  
-    st.session_state.chat.append({"role": "assistant", "content": "DO YOU WANT MORE INFO"})
-    st.session_state.waiting_more = True
+        return text
+
+def stream_gemini(messages, advanced):
+    genai.configure(api_key=gemini_key)
+    model = "gemini-1.5-pro" if advanced else "gemini-1.5-flash"
+    g = genai.GenerativeModel(model)
+    # Gemini doesn’t stream in python client → simulate
+    full_prompt = "\n".join([m["content"] for m in messages])
+    resp = g.generate_content(full_prompt)
+    with st.chat_message("assistant"):
+        spot = st.empty()
+        for i in range(0, len(resp.text), 50):
+            spot.write(resp.text[:i+50])
+        return resp.text
+
+def stream_mistral(messages, advanced):
+    model = "mistral-large-latest" if advanced else "mistral-small-latest"
+    headers = {"Authorization": f"Bearer {mistral_key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "stream": False}
+    r = requests.post("https://api.mistral.ai/v1/chat/completions",
+                      headers=headers, data=json.dumps(payload), timeout=60)
+    data = r.json()
+    if "choices" not in data:
+        return f"Mistral error: {data.get('error', data)}"
+    text = data["choices"][0]["message"]["content"]
+    with st.chat_message("assistant"):
+        spot = st.empty()
+        for i in range(0, len(text), 50):
+            spot.write(text[:i+50])
+        return text
+
+# -----------------------
+# Display conversation
+# -----------------------
+for m in st.session_state.chat:
+    with st.chat_message(m["role"]):
+        st.write(m["content"])
+
+user_msg = st.chat_input("Type your question...")
 
 if user_msg:
-    if st.session_state.waiting_more:
-        if user_msg.lower().startswith("y"):
-            ask_model("Yes, give me more info.")
-        elif user_msg.lower().startswith("n"):
-            st.session_state.chat.append({"role": "assistant", "content": "Okay! What new question can I help with?"})
-            st.session_state.waiting_more = False
-        else:
-            ask_model(user_msg)
-            st.session_state.waiting_more = False
+    # Add user msg
+    st.session_state.chat.append({"role": "user", "content": user_msg})
+
+    # Add context from URLs
+    context = get_combined_context()
+    if context:
+        st.session_state.chat.append({"role": "system", "content": "Reference info:\n" + context})
+
+    # Apply memory policy
+    msgs = apply_memory(st.session_state.chat)
+
+    # Call selected model
+    if provider == "OpenAI":
+        out = stream_openai(msgs, use_advanced)
+    elif provider == "Google (Gemini)":
+        out = stream_gemini(msgs, use_advanced)
     else:
-        ask_model(user_msg)
+        out = stream_mistral(msgs, use_advanced)
+
+    # Save assistant response
+    st.session_state.chat.append({"role": "assistant", "content": out})
+
+    # If summary memory → update summary
+    if memory_type == "Summary":
+        st.session_state.summary += " " + user_msg + " -> " + out
