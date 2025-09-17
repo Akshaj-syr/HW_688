@@ -9,9 +9,7 @@ st.set_page_config(page_title="HW3 Chatbot")
 
 st.title("HW3 — Streaming Chatbot with URLs")
 
-# -----------------------
-# Sidebar options
-# -----------------------
+
 url1 = st.sidebar.text_input("Enter first URL")
 url2 = st.sidebar.text_input("Enter second URL (optional)")
 
@@ -29,16 +27,12 @@ memory_type = st.sidebar.radio(
     index=0,
 )
 
-# -----------------------
-# API Keys
-# -----------------------
+
 openai_key = st.secrets.get("OPENAI_API_KEY")
 gemini_key = st.secrets.get("GEMINI_API_KEY")
 mistral_key = st.secrets.get("MISTRAL_API_KEY")
 
-# -----------------------
-# Helpers
-# -----------------------
+
 def read_url_content(u: str) -> str:
     try:
         r = requests.get(u, timeout=20)
@@ -54,11 +48,9 @@ def get_combined_context() -> str:
     if url2:
         text2 = read_url_content(url2)
     combined = text1 + "\n\n" + text2
-    return combined[:20000]  # safety cutoff
+    return combined[:20000]  
 
-# -----------------------
-# Memory handling
-# -----------------------
+
 if "chat" not in st.session_state:
     st.session_state.chat = [
         {"role": "system", "content": "Explain things simply and clearly."}
@@ -68,13 +60,13 @@ if "summary" not in st.session_state:
 
 def apply_memory(msgs):
     if memory_type == "Buffer (6 Qs)":
-        return msgs[-12:]  # user+assistant → 6 Q&A = 12 msgs
+        return msgs[-12:] 
     elif memory_type == "Summary":
         return [
             {"role": "system", "content": "Summary of conversation so far: " + st.session_state.summary}
-        ] + msgs[-2:]  # keep last exchange
+        ] + msgs[-2:] 
     elif memory_type == "Buffer (2000 tokens)":
-        # crude cutoff: ~4 chars/token → 8000 chars
+       
         total = ""
         result = []
         for m in reversed(msgs):
@@ -85,9 +77,7 @@ def apply_memory(msgs):
         return result
     return msgs
 
-# -----------------------
-# LLM Functions
-# -----------------------
+
 def stream_openai(messages, advanced):
     client = OpenAI(api_key=openai_key)
     model = "gpt-4o" if advanced else "gpt-4o-mini"
@@ -108,7 +98,6 @@ def stream_gemini(messages, advanced):
     genai.configure(api_key=gemini_key)
     model = "gemini-1.5-pro" if advanced else "gemini-1.5-flash"
     g = genai.GenerativeModel(model)
-    # Gemini doesn’t stream in python client → simulate
     full_prompt = "\n".join([m["content"] for m in messages])
     resp = g.generate_content(full_prompt)
     with st.chat_message("assistant"):
@@ -133,9 +122,7 @@ def stream_mistral(messages, advanced):
             spot.write(text[:i+50])
         return text
 
-# -----------------------
-# Display conversation
-# -----------------------
+
 for m in st.session_state.chat:
     with st.chat_message(m["role"]):
         st.write(m["content"])
@@ -143,18 +130,18 @@ for m in st.session_state.chat:
 user_msg = st.chat_input("Type your question...")
 
 if user_msg:
-    # Add user msg
+
     st.session_state.chat.append({"role": "user", "content": user_msg})
 
-    # Add context from URLs
+    
     context = get_combined_context()
     if context:
         st.session_state.chat.append({"role": "system", "content": "Reference info:\n" + context})
 
-    # Apply memory policy
+    
     msgs = apply_memory(st.session_state.chat)
 
-    # Call selected model
+    
     if provider == "OpenAI":
         out = stream_openai(msgs, use_advanced)
     elif provider == "Google (Gemini)":
@@ -162,9 +149,9 @@ if user_msg:
     else:
         out = stream_mistral(msgs, use_advanced)
 
-    # Save assistant response
+    
     st.session_state.chat.append({"role": "assistant", "content": out})
 
-    # If summary memory → update summary
+    
     if memory_type == "Summary":
         st.session_state.summary += " " + user_msg + " -> " + out
