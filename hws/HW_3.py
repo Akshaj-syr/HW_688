@@ -80,7 +80,7 @@ def apply_memory(msgs):
 
 def stream_openai(messages, advanced):
     client = OpenAI(api_key=openai_key)
-    model = "gpt-4o" if advanced else "gpt-4o-mini"
+    model = "gpt-5" if advanced else "gpt-5-mini"
     with st.chat_message("assistant"):
         text = ""
         spot = st.empty()
@@ -96,7 +96,7 @@ def stream_openai(messages, advanced):
 
 def stream_gemini(messages, advanced):
     genai.configure(api_key=gemini_key)
-    model = "gemini-1.5-pro" if advanced else "gemini-1.5-flash"
+    model = "gemini-2.5-pro" if advanced else "gemini-2.5-flash"
     g = genai.GenerativeModel(model)
     full_prompt = "\n".join([m["content"] for m in messages])
     resp = g.generate_content(full_prompt)
@@ -107,7 +107,7 @@ def stream_gemini(messages, advanced):
         return resp.text
 
 def stream_mistral(messages, advanced):
-    model = "mistral-large-latest" if advanced else "mistral-small-latest"
+    model = "mistral-medium-2508t" if advanced else "mistral-small-2506"
     headers = {"Authorization": f"Bearer {mistral_key}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "stream": False}
     r = requests.post("https://api.mistral.ai/v1/chat/completions",
