@@ -1,3 +1,10 @@
+try:
+    __import__("pysqlite3")
+    import sys as _sys
+    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
+except Exception:
+    pass
+
 import os
 import sys
 import re
@@ -10,12 +17,7 @@ from chromadb.config import Settings
 from bs4 import BeautifulSoup
 import requests 
 
-try:
-    __import__("pysqlite3")
-    import sys as _sys
-    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
-except Exception:
-    pass
+
 
 
 st.set_page_config(page_title="HW4 — iSchool RAG Chatbot")
@@ -47,7 +49,7 @@ if "openai_client" not in st.session_state:
 openai_client = st.session_state.openai_client
 
 
-DATA_DIR = Path("/workspaces/HW_688/data/su_orgs/su_orgs")                 
+DATA_DIR = Path("data/su_orgs")                 
 PERSIST_DIR = Path("data/.hw4_chroma")          
 COLLECTION_NAME = "ischool_orgs_hw4"
 
