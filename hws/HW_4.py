@@ -10,8 +10,13 @@ from chromadb.config import Settings
 from bs4 import BeautifulSoup
 import requests 
 
-__import__('pysqlite3')
-sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+try:
+    __import__("pysqlite3")
+    import sys as _sys
+    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
+except Exception:
+    pass
+
 
 st.set_page_config(page_title="HW4 — iSchool RAG Chatbot")
 st.title("HW4 — iSchool RAG Chatbot (Student Orgs)")
