@@ -19,7 +19,7 @@ st.title("HW4 — iSchool RAG Chatbot (Student Orgs)")
 st.sidebar.header("Settings")
 model_choice = st.sidebar.selectbox(
     "Choose LLM",
-    ["gpt-5-mini", "Mistral", "Gemini 2.5"],
+    ["gpt-5", "Mistral", "Gemini 2.5"],
     index=0,
 )
 show_sources_inline = st.sidebar.checkbox("Show sources inline in the answer", value=True)
@@ -34,9 +34,7 @@ st.sidebar.markdown(
     """
 )
 
-# ---------------------------
-# API clients / secrets
-# ---------------------------
+
 OPENAI_KEY = st.secrets.get("OPENAI_API_KEY")
 GEMINI_KEY = st.secrets.get("GEMINI_API_KEY")
 MISTRAL_KEY = st.secrets.get("MISTRAL_API_KEY")
@@ -50,16 +48,12 @@ if "openai_client" not in st.session_state:
 
 openai_client = st.session_state.openai_client
 
-# ---------------------------
-# Paths & Chroma settings
-# ---------------------------
-DATA_DIR = Path("/workspaces/HW_688/data/su_orgs/su_orgs")                 # put your unzipped HTMLs here
-PERSIST_DIR = Path("data/.hw4_chroma")          # persisted vector DB
+
+DATA_DIR = Path("/workspaces/HW_688/data/su_orgs/su_orgs")                 
+PERSIST_DIR = Path("data/.hw4_chroma")          
 COLLECTION_NAME = "ischool_orgs_hw4"
 
-# ---------------------------
-# HTML -> clean text
-# ---------------------------
+
 def html_to_text_file(fp: Path) -> str:
     """
     Extract visible text from an HTML file.
@@ -70,27 +64,20 @@ def html_to_text_file(fp: Path) -> str:
     for tag in soup(["script", "style", "noscript"]):
         tag.extract()
     text = soup.get_text(separator=" ")
-    # collapse whitespace
+    
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-# ---------------------------
-# Chunking: exactly two chunks per doc
-# ---------------------------
+
 def split_into_two_sentence_aware(text: str) -> tuple[str, str]:
-    """
-    Exactly TWO chunks (assignment requirement).
-    Strategy:
-      - Split near the middle, but try to cut on a sentence boundary
-        found by searching left ~600 chars for '.', '!' or '?'.
-    """
+    
     if not text:
         return "", ""
     mid = len(text) // 2
     window_start = max(0, mid - 600)
     window = text[window_start:mid]
 
-    # find last sentence boundary in window
+    
     boundary = max(window.rfind("."), window.rfind("!"), window.rfind("?"))
     split_idx = (window_start + boundary + 1) if boundary != -1 else mid
 
@@ -98,15 +85,13 @@ def split_into_two_sentence_aware(text: str) -> tuple[str, str]:
     c2 = text[split_idx:].strip()
 
     if not c1 or not c2:
-        # fallback exact half
+        
         half = max(1, len(text) // 2)
         c1, c2 = text[:half].strip(), text[half:].strip()
 
     return c1, c2
 
-# ---------------------------
-# Build (or load) the vector DB
-# ---------------------------
+
 def get_chroma_collection():
     PERSIST_DIR.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(PERSIST_DIR), settings=Settings(allow_reset=False))
@@ -116,10 +101,7 @@ def get_chroma_collection():
     return client.create_collection(COLLECTION_NAME, metadata={"chunks_per_file": 2, "source": "su_orgs_html"})
 
 def build_index():
-    """
-    Build embeddings for *exactly two chunks per HTML file* and add to Chroma.
-    This runs only when you click the build button.
-    """
+    
     if not DATA_DIR.exists():
         st.error(f"Data folder not found: {DATA_DIR.resolve()}")
         return None
@@ -139,7 +121,7 @@ def build_index():
             text = html_to_text_file(fp)
             c1, c2 = split_into_two_sentence_aware(text)
 
-            # always two ids per file
+            
             ids.extend([f"{fp.name}::1", f"{fp.name}::2"])
             docs.extend([c1, c2])
             metas.extend([
@@ -151,7 +133,7 @@ def build_index():
                 _flush_batch(collection, ids, docs, metas)
                 ids, docs, metas = [], [], []
 
-        # flush any remainder
+        
         if ids:
             _flush_batch(collection, ids, docs, metas)
 
@@ -159,7 +141,7 @@ def build_index():
     return collection
 
 def _flush_batch(collection, ids, docs, metas):
-    # embed using OpenAI
+    
     vectors = []
     for t in docs:
         if not t:
@@ -168,17 +150,15 @@ def _flush_batch(collection, ids, docs, metas):
         vectors.append(emb.data[0].embedding)
     collection.add(ids=ids, documents=docs, metadatas=metas, embeddings=vectors)
 
-# ---------------------------
-# Retrieval helper
-# ---------------------------
+
 def retrieve_chunks(collection, question: str, k: int):
-    # Embed the query using the same embedding model you used to index
+    
     q_vec = openai_client.embeddings.create(
         model="text-embedding-3-small",
         input=question
     ).data[0].embedding
 
-    # Query by embeddings (no embedding_function needed on the collection)
+    
     res = collection.query(
         query_embeddings=[q_vec],
         n_results=k,
@@ -189,15 +169,11 @@ def retrieve_chunks(collection, question: str, k: int):
     return docs, metas
 
 
-# ---------------------------
-# Provider callers
-# ---------------------------
+
 def call_openai(messages):
     resp = openai_client.chat.completions.create(
-        model="gpt-5-mini",
-        messages=messages,
-        temperature=0.2,
-    )
+        model="gpt-5",
+        messages=messages,)
     return resp.choices[0].message.content.strip()
 
 def call_gemini(messages):
@@ -206,7 +182,7 @@ def call_gemini(messages):
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_KEY)
     model = genai.GenerativeModel("gemini-2.5-pro")
-    # very plain: just concat message contents
+    
     prompt = "\n".join(m["content"] for m in messages)
     resp = model.generate_content(prompt)
     return getattr(resp, "text", "") or "[Empty response]"
@@ -215,7 +191,7 @@ def call_mistral(messages):
     if not MISTRAL_KEY:
         return "[Missing MISTRAL_API_KEY]"
     headers = {"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "mistral-small", "messages": messages, "stream": False}
+    payload = {"model": "mistral-small-2506", "messages": messages, "stream": False}
     r = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload, timeout=60)
     data = r.json()
     if "choices" not in data:
@@ -223,16 +199,14 @@ def call_mistral(messages):
     return data["choices"][0]["message"]["content"].strip()
 
 def ask_model(provider_name: str, messages):
-    if provider_name == "gpt-5-mini":
+    if provider_name == "gpt-5":
         return call_openai(messages)
     elif provider_name == "Gemini 2.5":
         return call_gemini(messages)
     else:
         return call_mistral(messages)
 
-# ---------------------------
-# Build / load controls
-# ---------------------------
+
 st.subheader("Step 1 — Build / Load Index")
 col_a, col_b = st.columns([1,1])
 with col_a:
@@ -246,7 +220,6 @@ if "collection" not in st.session_state:
 if st.button("🔧 Build / Update Index"):
     st.session_state.collection = build_index()
 
-# Lazy load existing collection (if already built previously)
 if st.session_state.collection is None and PERSIST_DIR.exists():
     try:
         client = chromadb.PersistentClient(path=str(PERSIST_DIR))
@@ -256,17 +229,17 @@ if st.session_state.collection is None and PERSIST_DIR.exists():
 
 if st.session_state.collection:
     try:
-        st.info(f"✅ Collection ready • {st.session_state.collection.count()} chunks")
+        st.info(f"Collection ready • {st.session_state.collection.count()} chunks")
     except Exception:
-        st.info("✅ Collection ready")
+        st.info("Collection ready")
 
-# ---------------------------
+# 
 # Chat state
-# ---------------------------
+
 if "chat_log" not in st.session_state:
-    st.session_state.chat_log = []  # [{"role": "user"/"assistant", "content": "..."}]
+    st.session_state.chat_log = []  
 if "qa_memory" not in st.session_state:
-    st.session_state.qa_memory = [] # [{"q": "...", "a": "..."}]
+    st.session_state.qa_memory = [] 
 
 # render history
 st.subheader("Step 2 — Chat")
@@ -274,9 +247,7 @@ for m in st.session_state.chat_log:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# ---------------------------
-# User prompt handling
-# ---------------------------
+
 user_q = st.chat_input("Ask about iSchool student organizations…")
 if user_q:
     st.session_state.chat_log.append({"role": "user", "content": user_q})
@@ -287,10 +258,10 @@ if user_q:
         st.error("Please build/load the index first (top of page).")
         st.stop()
 
-    # retrieve context
+    
     docs, metas = retrieve_chunks(st.session_state.collection, user_q, k=top_k)
 
-    # format evidence (shorter; different from friend's formatting)
+    
     src_list = []
     for md in metas or []:
         fn = md.get("filename")
@@ -303,12 +274,12 @@ if user_q:
     evidence = "\n\n---\n\n".join(docs) if docs else ""
     src_line = f"\n\nSources: {', '.join(src_list)}" if src_list else ""
 
-    # build messages
+    
     system_msg = (
         "You are a helpful assistant for Syracuse iSchool student organizations. "
         "Use the retrieved context to answer. If the context doesn't contain the answer, say so briefly."
     )
-    # 5-turn memory (user+assistant pairs)
+    
     mem_pairs = st.session_state.qa_memory[-5:]
     mem_block = ""
     if mem_pairs:
@@ -324,10 +295,10 @@ if user_q:
         {"role": "user", "content": user_block},
     ]
 
-    # call chosen model
+    
     answer = ask_model(model_choice, messages)
 
-    # display + history update
+    
     with st.chat_message("assistant"):
         st.markdown(answer)
         with st.expander("Show retrieved sources"):
@@ -339,4 +310,4 @@ if user_q:
 
     st.session_state.chat_log.append({"role": "assistant", "content": answer})
     st.session_state.qa_memory.append({"q": user_q, "a": answer})
-    st.session_state.qa_memory = st.session_state.qa_memory[-5:]  # keep last 5
+    st.session_state.qa_memory = st.session_state.qa_memory[-5:]  
