@@ -48,7 +48,17 @@ if "openai_client" not in st.session_state:
 openai_client = st.session_state.openai_client
 
 
-DATA_DIR = Path("data/su_orgs/su_orgs")                 
+DATA_DIR = Path("data/su_orgs/su_orgs")  
+candidates = [
+    Path("data/su_orgs"),
+    Path("data/su_orgs/su_orgs"),  # nested by mistake
+    Path("su_orgs"),
+]
+for p in candidates:
+    if p.exists() and any(p.glob("*.html")):
+        DATA_DIR = p
+        break
+
 PERSIST_DIR = Path("data/.hw4_chroma")          
 COLLECTION_NAME = "ischool_orgs_hw4"
 
