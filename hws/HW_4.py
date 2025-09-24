@@ -16,6 +16,7 @@ import chromadb
 from chromadb.config import Settings
 from bs4 import BeautifulSoup
 import requests 
+import glob
 
 
 
