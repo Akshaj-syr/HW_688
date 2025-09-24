@@ -48,7 +48,7 @@ if "openai_client" not in st.session_state:
 openai_client = st.session_state.openai_client
 
 
-DATA_DIR = Path("data/su_orgs/su_orgs")  
+DATA_DIR = Path("data/su_orgs")  
 candidates = [
     Path("data/su_orgs"),
     Path("data/su_orgs/su_orgs"),  # nested by mistake
