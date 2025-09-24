@@ -25,14 +25,7 @@ model_choice = st.sidebar.selectbox(
 show_sources_inline = st.sidebar.checkbox("Show sources inline in the answer", value=True)
 top_k = st.sidebar.slider("Top-K retrieved chunks", 1, 10, 4, 1)
 
-st.sidebar.markdown(
-    """
-    **RAG flow**  
-    1) Build index from your HTML files  
-    2) Ask a question  
-    3) Model answers using retrieved chunks  
-    """
-)
+
 
 
 OPENAI_KEY = st.secrets.get("OPENAI_API_KEY")
