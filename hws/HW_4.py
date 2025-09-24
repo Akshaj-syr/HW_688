@@ -48,7 +48,7 @@ if "openai_client" not in st.session_state:
 openai_client = st.session_state.openai_client
 
 
-DATA_DIR = Path("/workspaces/HW_688/data/su_orgs/su_orgs")                 
+DATA_DIR = Path("data/su_orgs/su_orgs")                 
 PERSIST_DIR = Path("data/.hw4_chroma")          
 COLLECTION_NAME = "ischool_orgs_hw4"
 
