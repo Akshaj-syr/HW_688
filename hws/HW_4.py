@@ -19,8 +19,6 @@ import requests
 
 
 
-
-st.set_page_config(page_title="HW4 — iSchool RAG Chatbot")
 st.title("HW4 — iSchool RAG Chatbot (Student Orgs)")
 
 st.sidebar.header("Settings")
