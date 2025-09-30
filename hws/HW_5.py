@@ -37,7 +37,7 @@ openai_client = st.session_state.openai_client
 
 
 DATA_DIR = Path("data/su_orgs")
-PERSIST_DIR = Path("data/.chroma_hw")
+PERSIST_DIR = Path("data/chroma_hw_V2")
 COLLECTION_NAME = "ischool_orgs_hw4"
 
 def get_chroma_collection():

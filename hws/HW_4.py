@@ -59,7 +59,7 @@ for p in candidates:
         DATA_DIR = p
         break
 
-PERSIST_DIR = Path("data/.chroma_hw")          
+PERSIST_DIR = Path("data/chroma_hw_V2")          
 COLLECTION_NAME = "ischool_orgs_hw4"
 
 
