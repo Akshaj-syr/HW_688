@@ -1,14 +1,4 @@
-# HW — Legal News Reporter (Chroma + RAG, OpenAI + Gemini)
-# -------------------------------------------------------
-# Similar overall approach: CSV -> build/load Chroma -> retrieve -> rank/summarize.
-# Differences from your friend's:
-#  - New structure & naming
-#  - CSV schema adapter supporting two schemas
-#  - Different scoring weights & rationale wording
-#  - Two-LMs = OpenAI OR Gemini for explanations
-#  - UI copy + flow changed; no hardcoded paths
 
-# --- sqlite shim for Chroma on some hosts ---
 try:
     __import__("pysqlite3")
     import sys as _sys
@@ -16,128 +6,85 @@ try:
 except Exception:
     pass
 
-import os, re, math, json
+import os, math, json
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 import pandas as pd
 import chromadb
 from chromadb.config import Settings
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from openai import OpenAI
 
-# Optional Gemini (for LLM summaries)
-# pip install google-generativeai
 try:
     import google.generativeai as genai
 except Exception:
     genai = None
 
-# ---------------- UI ----------------
-st.title("Legal News Reporter")
+
+st.title("News Info Bot")
 
 st.markdown(
-    "Upload a CSV of news items and ask:\n\n"
-    "• **Most interesting news** (for a law-firm audience)\n"
-    "• **News about &lt;topic&gt;** (semantic match)\n\n"
-    "Uses a Chroma vector DB for retrieval, deterministic legal signals for ranking, "
-    "and optional LLM (OpenAI/Gemini) for concise explanations."
+    "Upload your CSV (company_name, days_since_2000, Date, Document, URL) and ask:\n"
+    "• **Most interesting news**\n"
+    "• **News about a topic**\n\n"
+    "Ranking = recency + legal keywords. LLMs (OpenAI/Gemini) explain rankings only."
 )
 
-# -------------- Sidebar --------------
-st.sidebar.header("Settings")
+st.sidebar.header("Upload CSV")
+csv_file = st.sidebar.file_uploader("Upload your CSV file", type=["csv"])
 
-# Data input
-csv_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-use_sample_path = st.sidebar.checkbox("Use sample path instead of upload", value=False)
-sample_path = st.sidebar.text_input("Sample path", value="data/news_for_app.csv")
+st.sidebar.header("LLM Options")
+vendor = st.sidebar.selectbox("Vendor", ["OpenAI", "Gemini"])
+speed = st.sidebar.radio("Speed", ["Normal", "Quick"], horizontal=True)
 
-# Vector DB controls
-CHROMA_DIR = st.sidebar.text_input("Chroma path", value="data/chroma_newsdb")
-COLLECTION = st.sidebar.text_input("Collection name", value="legal_news_v1")
-EMBED_MODEL = st.sidebar.selectbox("Embedding model", ["text-embedding-3-small"], index=0)
-
-# Results & display
-TOP_K = st.sidebar.slider("Top-K results", 3, 20, 8, 1)
-show_urls = st.sidebar.checkbox("Show URLs", value=True)
-
-# LLM choices (for summaries/explanations)
-LLM_VENDOR = st.sidebar.selectbox("LLM Vendor (summaries)", ["None", "OpenAI", "Gemini"], index=0)
 OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
-OPENAI_SUMMARY_MODEL = st.sidebar.text_input("OpenAI model (optional)", value="gpt-4o-mini")
-GEMINI_MODEL = st.sidebar.text_input("Gemini model (optional)", value="gemini-2.0-flash")
 
-# ---------------- CSV Loader + Adapter ----------------
-REQUIRED_LAB = {"id","title","summary","content","published_at","source","url"}
+MODEL_MAP = {
+    ("OpenAI", "Normal"): "gpt-5",
+    ("OpenAI", "Quick"): "gpt-5-nano",
+    ("Gemini", "Normal"): "gemini-2.5-pro",
+    ("Gemini", "Quick"): "gemini-2.5-flash-lite",
+}
+
+CHROMA_DIR = "data/chroma_simple_news"
+COLLECTION = "legal_news_simple"
+EMBED_FN = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+
 
 def load_csv() -> Optional[pd.DataFrame]:
-    if csv_file is not None and not use_sample_path:
-        try:
-            return pd.read_csv(csv_file)
-        except Exception as e:
-            st.error(f"Failed to read uploaded CSV: {e}")
-            return None
-    if use_sample_path:
-        try:
-            return pd.read_csv(sample_path)
-        except Exception as e:
-            st.error(f"Failed to read sample path '{sample_path}': {e}")
-            return None
-    st.info("Upload a CSV or enable 'Use sample path'.")
-    return None
+    if csv_file is None:
+        st.info("Upload your CSV file to continue.")
+        return None
+    try:
+        df = pd.read_csv(csv_file)
+        
+        cols = set(df.columns.str.lower())
+        if {"company_name", "days_since_2000", "date", "document", "url"}.issubset(cols):
+            df_out = pd.DataFrame({
+                "id": range(1, len(df) + 1),
+                "title": df["Document"].astype(str),
+                "summary": "",
+                "content": df["Document"].astype(str),
+                "published_at": pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d"),
+                "source": df["company_name"].astype(str),
+                "url": df["URL"].astype(str)
+            })
+            return df_out
+        else:
+            return df
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
+        return None
 
-def to_lab_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adapter: Accept either friend's schema or lab schema and map to lab fields.
-    Friend's schema: company_name, days_since_2000, Date, Document, URL
-    """
-    cols = set(df.columns.str.lower())
-    # Already in lab schema?
-    if REQUIRED_LAB.issubset(set(df.columns)):
-        return df.copy()
-
-    # Friend's schema -> lab mapping
-    if {"company_name","days_since_2000","date","document","url"}.issubset(cols):
-        dfl = df.copy()
-        # Normalize casing access robustly
-        def col(c): return dfl[[x for x in dfl.columns if x.lower()==c][0]]
-        out = pd.DataFrame({
-            "id": range(1, len(dfl)+1),
-            "title": col("document").astype(str),
-            "summary": "",
-            "content": col("document").astype(str),
-            "published_at": pd.to_datetime(col("date"), errors="coerce").dt.strftime("%Y-%m-%d"),
-            "source": col("company_name").astype(str),
-            "url": col("url").astype(str),
-        })
-        # Keep rows even if date is NaT (recency will degrade gracefully)
-        return out
-
-    raise ValueError(
-        "CSV does not match expected schemas. Provide lab columns "
-        "(id,title,summary,content,published_at,source,url) "
-        "or friend's columns (company_name, days_since_2000, Date, Document, URL)."
-    )
-
-df_raw = load_csv()
-if df_raw is None:
+df = load_csv()
+if df is None:
     st.stop()
 
-try:
-    df = to_lab_schema(df_raw)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
 
-# Validate minimal set
-missing = REQUIRED_LAB - set(df.columns)
-if missing:
-    st.error(f"Missing columns after mapping: {missing}")
-    st.stop()
-
-# ----------------- Legal Signals (deterministic) -----------------
 LAW_TERMS = [
     "lawsuit","litigation","sued","settlement","regulation","regulatory","fine","penalty",
     "cfpb","sec","doj","ftc","antitrust","compliance","investigation","merger","acquisition",
@@ -148,13 +95,9 @@ LAW_TERMS = [
 def legal_keyword_score(text: str) -> float:
     t = (text or "").lower()
     hits = sum(1 for kw in LAW_TERMS if kw in t)
-    # saturate: 0..1
     return min(hits/8.0, 1.0)
 
 def recency_score(ymd: str) -> float:
-    """
-    7-day half-life; invalid dates => neutral 0.5
-    """
     try:
         dt = datetime.strptime(ymd, "%Y-%m-%d")
         days = max((datetime.utcnow() - dt).days, 0)
@@ -171,96 +114,64 @@ class Ranked:
     tags: List[str]
 
 def heuristic_rank(items: List[Dict[str, Any]]) -> List[Ranked]:
-    ranked: List[Ranked] = []
+    ranked = []
     for it in items:
-        title = it.get("title","")
-        content = it.get("content","")
-        published_at = it.get("published_at","")
-        url = it.get("url","")
-
-        k = legal_keyword_score(f"{title} {content}")
-        r = recency_score(str(published_at))
-        # Different weighting from friend’s; clear it’s our own:
-        # emphasize recency a bit more (for law firms) + legal signal
+        title, content = it.get("title", ""), it.get("content", "")
+        date, url = it.get("published_at", ""), it.get("url", "")
+        k, r = legal_keyword_score(f"{title} {content}"), recency_score(date)
         score = 0.5*r + 0.4*k + 0.1
         tags = []
         if r >= 0.5: tags.append("recent")
         if k >= 0.4: tags.append("legal-salient")
-        ranked.append(Ranked(it.get("id"), title, url, round(score,4), tags))
-    ranked.sort(key=lambda x: x.score, reverse=True)
-    return ranked
+        ranked.append(Ranked(it.get("id"), title, url, round(score, 4), tags))
+    return sorted(ranked, key=lambda x: x.score, reverse=True)
 
-# ----------------- Chroma Index -----------------
+
 def get_chroma():
     os.makedirs(CHROMA_DIR, exist_ok=True)
-    client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(allow_reset=False))
-    return client
+    return chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(allow_reset=False))
 
-def build_collection(client: chromadb.PersistentClient, df: pd.DataFrame) -> None:
-    """
-    Build (or rebuild) collection from the lab schema.
-    Chunks are simply the rows; metadata used in answers.
-    """
+def build_collection(client, df):
     try:
         client.delete_collection(COLLECTION)
     except Exception:
         pass
-    col = client.get_or_create_collection(COLLECTION)
-    openai_client = OpenAI(api_key=OPENAI_KEY)  # embeddings only
+    col = client.get_or_create_collection(COLLECTION, embedding_function=EMBED_FN)
     docs, ids, metas = [], [], []
-    for i, row in df.iterrows():
-        txt = f"{row['title']}\n\n{row.get('summary','')}\n\n{row.get('content','')}"
+    for _, row in df.iterrows():
+        txt = f"{row['title']}\n\n{row['summary']}\n\n{row['content']}"
         docs.append(txt)
-        ids.append(str(row['id']))
+        ids.append(str(row["id"]))
         metas.append({
             "id": row["id"],
             "title": row["title"],
             "url": row["url"],
             "published_at": row["published_at"],
-            "source": row["source"],
+            "source": row["source"]
         })
-    # Embed with OpenAI
-    # (Chroma can also embed internally, but here we pass docs directly and let Chroma handle)
     col.add(documents=docs, metadatas=metas, ids=ids)
 
-def load_collection(client: chromadb.PersistentClient):
+def load_collection(client):
     try:
-        return client.get_collection(COLLECTION)
+        return client.get_collection(COLLECTION, embedding_function=EMBED_FN)
     except Exception:
         return None
 
-def retrieve_topic(collection, query: str, k: int) -> List[Dict[str, Any]]:
-    """
-    Vector search via Chroma; return metadata-rich items (rows).
-    """
-    openai_client = OpenAI(api_key=OPENAI_KEY)
-    q_vec = openai_client.embeddings.create(model=EMBED_MODEL, input=query).data[0].embedding
-    res = collection.query(query_embeddings=[q_vec], n_results=k, include=["documents","metadatas"])
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    out = []
-    for d, m in zip(docs, metas):
-        out.append({
-            "id": m.get("id"),
-            "title": m.get("title"),
-            "url": m.get("url",""),
-            "published_at": m.get("published_at",""),
-            "source": m.get("source",""),
-            "content": d,
-        })
-    return out
+def retrieve_topic(collection, query, k):
+    res = collection.query(query_texts=[query], n_results=k, include=["documents","metadatas"])
+    docs, metas = res.get("documents", [[]])[0], res.get("metadatas", [[]])[0]
+    return [{"id": m.get("id"), "title": m.get("title"), "url": m.get("url",""),
+             "published_at": m.get("published_at",""), "source": m.get("source",""),
+             "content": d} for d, m in zip(docs, metas)]
 
-def retrieve_broad(collection, k: int) -> List[Dict[str, Any]]:
-    """
-    Broad retrieval for “most interesting”: seed query with legal concepts.
-    """
+def retrieve_broad(collection, k):
     seed = "legal, regulatory, enforcement, litigation, compliance, antitrust, investigation"
     return retrieve_topic(collection, seed, k=k)
 
-# ----------------- LLM Explain/Summarize -----------------
-def llm_explain(vendor: str, rows: List[Ranked], df_map: Dict[Any, Dict[str, Any]]) -> str:
-    if vendor == "None" or not rows:
-        return "Explanation disabled."
+
+def llm_explain(vendor, speed, rows, df_map):
+    if not rows:
+        return "No items to explain."
     items = []
     for r in rows[: min(5, len(rows))]:
         meta = df_map.get(r.id, {})
@@ -270,113 +181,81 @@ def llm_explain(vendor: str, rows: List[Ranked], df_map: Dict[Any, Dict[str, Any
             "source": meta.get("source",""),
             "url": r.url,
             "score": r.score,
-            "tags": r.tags,
+            "tags": r.tags
         })
-    sys = (
-        "You are a legal-news analyst for a global law firm. "
-        "Briefly explain why these ranked items matter (enforcement/precedent, recency, jurisdiction)."
-    )
-    prompt = f"Items (top-{len(items)}):\n{json.dumps(items, indent=2)}\n\nExplain in 2–3 sentences total."
+    sys = ("You are a legal-news analyst. Summarize why these top items matter "
+           "(enforcement, recency, or impact).")
+    prompt = f"Items:\n{json.dumps(items, indent=2)}\n\nExplain in 2–3 sentences."
+    model = MODEL_MAP.get((vendor, speed))
     try:
         if vendor == "OpenAI":
             if not OPENAI_KEY: return "[Missing OPENAI_API_KEY]"
             client = OpenAI(api_key=OPENAI_KEY)
-            model = OPENAI_SUMMARY_MODEL or "gpt-4o-mini"
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role":"system","content": sys},
-                          {"role":"user","content": prompt}]
+                messages=[{"role": "system", "content": sys},
+                          {"role": "user", "content": prompt}]
             )
             return resp.choices[0].message.content.strip()
         elif vendor == "Gemini":
             if not GEMINI_KEY: return "[Missing GEMINI_API_KEY]"
             if genai is None: return "[google-generativeai not installed]"
             genai.configure(api_key=GEMINI_KEY)
-            model = genai.GenerativeModel(GEMINI_MODEL or "gemini-2.0-flash")
-            r = model.generate_content(sys + "\n\n" + prompt)
+            gmodel = genai.GenerativeModel(model)
+            r = gmodel.generate_content(sys + "\n\n" + prompt)
             return getattr(r, "text", "") or "[Empty response]"
         return "Explanation disabled."
     except Exception as e:
         return f"[LLM error: {e}]"
 
-# ----------------- Build/Load Index UI -----------------
-st.subheader("Vector DB")
-client = get_chroma()
-colA, colB = st.columns(2)
-with colA:
-    if st.button("Build / Rebuild Index"):
-        if not OPENAI_KEY:
-            st.error("Set OPENAI_API_KEY to build embeddings.")
-        else:
-            with st.spinner("Indexing documents…"):
-                build_collection(client, df)
-            st.success(f"Index built at {CHROMA_DIR} in '{COLLECTION}'.")
-with colB:
-    if st.button("Load Index"):
-        col = load_collection(client)
-        if col:
-            st.success(f"Collection '{COLLECTION}' loaded.")
-        else:
-            st.error("No collection found. Build it first.")
 
-# Always try to get collection for queries
+st.subheader("1) Build index")
+client = get_chroma()
+if st.button("Build / Rebuild Index"):
+    with st.spinner("Indexing documents..."):
+        build_collection(client, df)
+    st.success("Vector index built successfully!")
+
 collection = load_collection(client)
 if not collection:
-    st.warning("No collection loaded yet. Build/Load the index to enable retrieval.")
+    st.warning("No collection found. Click 'Build / Rebuild Index' first.")
 
-# ----------------- Chat / Actions -----------------
-st.subheader("Ask the bot")
-mode = st.radio("Choose action:", ["Most interesting news", "News about a topic"], horizontal=True)
+st.subheader("2) Ask a question")
+mode = st.radio("Select:", ["Most interesting news", "News about a topic"], horizontal=True)
 topic = ""
 if mode == "News about a topic":
-    topic = st.text_input("Topic (e.g., GDPR, antitrust, mergers)")
+    topic = st.text_input("Enter a topic (e.g., GDPR, antitrust, mergers)")
+top_k = st.slider("Top-K results", 3, 20, 8, 1)
 
 if st.button("Run"):
     if not collection:
-        st.error("Please build or load the index first.")
+        st.error("Please build the index first.")
         st.stop()
-
-    # Map id -> row meta from df for convenience
-    df_map = {row["id"]: row for _, row in df.iterrows()}
-
+    df_map = {r["id"]: r for _, r in df.iterrows()}
     if mode == "Most interesting news":
-        # Pull a broad set, then apply our heuristic rank
-        seed_hits = retrieve_broad(collection, k=max(TOP_K*4, 40))
-        ranked = heuristic_rank(seed_hits)[:TOP_K]
-        st.markdown("### Most Interesting (law-firm lens)")
+        hits = retrieve_broad(collection, k=max(top_k*4, 40))
+        ranked = heuristic_rank(hits)[:top_k]
+        st.markdown("### Most Interesting News")
         for i, r in enumerate(ranked, 1):
             meta = df_map.get(r.id, {})
-            line = f"**{i}. {r.title}** — _{', '.join(r.tags)}_"
-            if show_urls and r.url:
-                line += f"\n\n[{meta.get('source','')}]({r.url}) · {meta.get('published_at','')}"
-            else:
-                line += f" · {meta.get('source','')} · {meta.get('published_at','')}"
-            st.markdown(line)
-
-        with st.expander("Why this order? (LLM summary)"):
-            st.write(llm_explain(LLM_VENDOR, ranked, df_map))
-
+            st.markdown(f"**{i}. {r.title}** — _{', '.join(r.tags)}_\n\n"
+                        f"{meta.get('source','')} · {meta.get('published_at','')}  "
+                        + (f"[link]({r.url})" if r.url else ""))
+        with st.expander("Why this order? (LLM)"):
+            st.write(llm_explain(vendor, speed, ranked, df_map))
     else:
         if not topic.strip():
             st.warning("Enter a topic.")
             st.stop()
-        hits = retrieve_topic(collection, topic.strip(), k=TOP_K)
-        ranked = heuristic_rank(hits)  # light re-rank for legal/recency emphasis
+        hits = retrieve_topic(collection, topic.strip(), k=top_k)
+        ranked = heuristic_rank(hits)
         st.markdown(f"### News about **{topic.strip()}**")
         for i, r in enumerate(ranked, 1):
             meta = df_map.get(r.id, {})
-            line = f"**{i}. {r.title}** — _{', '.join(r.tags)}_"
-            if show_urls and r.url:
-                line += f"\n\n[{meta.get('source','')}]({r.url}) · {meta.get('published_at','')}"
-            else:
-                line += f" · {meta.get('source','')} · {meta.get('published_at','')}"
-            st.markdown(line)
+            st.markdown(f"**{i}. {r.title}** — _{', '.join(r.tags)}_\n\n"
+                        f"{meta.get('source','')} · {meta.get('published_at','')}  "
+                        + (f"[link]({r.url})" if r.url else ""))
+        with st.expander("Why these items? (LLM)"):
+            st.write(llm_explain(vendor, speed, ranked, df_map))
 
-        with st.expander("Why these items? (LLM summary)"):
-            st.write(llm_explain(LLM_VENDOR, ranked, df_map))
 
-# ----------------- Notes -----------------
-st.caption(
-    "Ranking is deterministic (recency + legal term salience). "
-    "LLM is used only for short explanations, not the ordering."
-)
