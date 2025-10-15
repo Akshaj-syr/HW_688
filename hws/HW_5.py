@@ -1,3 +1,17 @@
+# Simplified Legal News Bot — Upload-only + Chroma + OpenAI/Gemini (Normal/Quick)
+# - Upload CSV, build Chroma index, ask 2 things:
+#   (1) "Most interesting news" — deterministic legal-scoring
+#   (2) "News about <topic>" — vector search + light re-rank
+# - LLMs (OpenAI/Gemini) used only to explain results:
+#     OpenAI: gpt-5 (Normal), gpt-5-nano (Quick)
+#     Gemini: gemini-2.5-pro (Normal), gemini-2.5-flash-lite (Quick)
+#
+# NOTE: You must have keys in .streamlit/secrets.toml or env vars:
+#   OPENAI_API_KEY, GEMINI_API_KEY
+#
+# To avoid embedding dimension mismatches, we use Chroma with
+# SentenceTransformerEmbeddingFunction ("all-MiniLM-L6-v2", 384-d) and query_texts.
+
 try:
     __import__("pysqlite3")
     import sys as _sys
@@ -5,201 +19,284 @@ try:
 except Exception:
     pass
 
-import re
-from pathlib import Path
+import os, re, math, json
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
 import streamlit as st
-from openai import OpenAI
+import pandas as pd
 import chromadb
 from chromadb.config import Settings
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-st.title("HW5 — Short-Term Memory RAG (iSchool Orgs)")
+# LLM clients (explanations only)
+from openai import OpenAI
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
 
-st.sidebar.header("Settings")
-model_choice = st.sidebar.selectbox(
-    "Choose LLM", ["gpt-5", "Mistral", "Gemini 2.5"], index=0
+# --------------------------- UI --------------------------------
+st.set_page_config(page_title="Legal News — Simple RAG", layout="wide")
+st.title("⚖️ Legal News — Simple RAG")
+
+st.markdown(
+    "Upload a CSV of news items and then:\n\n"
+    "• **Most interesting news** (law-firm lens)\n"
+    "• **News about &lt;topic&gt;** (semantic)\n\n"
+    "Ranking is deterministic (recency + legal keywords). An LLM can optionally "
+    "explain the ordering using your chosen vendor & speed."
 )
-top_k = st.sidebar.slider("Top-K retrieved chunks", 1, 10, 4, 1)
-memory_turns = st.sidebar.slider("Short-term memory (last N Q&A)", 0, 10, 5, 1)
-show_sources_inline = st.sidebar.checkbox("Show sources inline in the answer", value=True)
 
+# Sidebar — minimal controls
+st.sidebar.header("Upload CSV")
+csv_file = st.sidebar.file_uploader("CSV (required columns below)", type=["csv"])
+st.sidebar.caption("Required: id, title, summary, content, published_at (YYYY-MM-DD), source, url")
 
-OPENAI_KEY = st.secrets.get("OPENAI_API_KEY")
-GEMINI_KEY = st.secrets.get("GEMINI_API_KEY")
-MISTRAL_KEY = st.secrets.get("MISTRAL_API_KEY")
+st.sidebar.header("LLM (explanations only)")
+vendor = st.sidebar.selectbox("Vendor", ["OpenAI", "Gemini"])
+speed = st.sidebar.radio("Speed", ["Normal", "Quick"], horizontal=True)
 
-if not OPENAI_KEY:
-    st.error("Missing OPENAI_API_KEY in .streamlit/secrets.toml")
+OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+
+# Map (vendor, speed) -> model names (as you requested)
+MODEL_MAP = {
+    ("OpenAI", "Normal"): "gpt-5",
+    ("OpenAI", "Quick"):  "gpt-5-nano",
+    ("Gemini", "Normal"): "gemini-2.5-pro",
+    ("Gemini", "Quick"):  "gemini-2.5-flash-lite",
+}
+
+# Chroma defaults (hidden from UI for simplicity)
+CHROMA_DIR = "data/chroma_simple_news"
+COLLECTION = "legal_news_simple"
+EMBED_FN = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")  # 384-d
+
+# ---------------------- CSV loader & validator ------------------
+REQUIRED = {"id","title","summary","content","published_at","source","url"}
+
+def load_csv() -> Optional[pd.DataFrame]:
+    if csv_file is None:
+        st.info("Upload a CSV to continue.")
+        return None
+    try:
+        return pd.read_csv(csv_file)
+    except Exception as e:
+        st.error(f"Failed to read CSV: {e}")
+        return None
+
+df = load_csv()
+if df is None:
     st.stop()
 
-if "openai_client" not in st.session_state:
-    st.session_state.openai_client = OpenAI(api_key=OPENAI_KEY)
-openai_client = st.session_state.openai_client
+missing = REQUIRED - set(df.columns)
+if missing:
+    st.error(f"CSV missing columns: {missing}")
+    st.stop()
 
+# ---------------------- Deterministic scoring -------------------
+LAW_TERMS = [
+    "lawsuit","litigation","sued","settlement","regulation","regulatory","fine","penalty",
+    "cfpb","sec","doj","ftc","antitrust","compliance","investigation","merger","acquisition",
+    "bankruptcy","governance","sanction","enforcement","gdpr","ico","data protection","privacy",
+    "appeal","precedent","ransomware","breach","frand","class action"
+]
 
-DATA_DIR = Path("data/su_orgs")
-PERSIST_DIR = Path("data/chroma_hw_V2")
-COLLECTION_NAME = "ischool_orgs_hw4"
+def legal_keyword_score(text: str) -> float:
+    t = (text or "").lower()
+    hits = sum(1 for kw in LAW_TERMS if kw in t)
+    return min(hits/8.0, 1.0)
 
-def get_chroma_collection():
-    PERSIST_DIR.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(PERSIST_DIR), settings=Settings(allow_reset=False))
-    names = [c.name for c in client.list_collections()]
-    if COLLECTION_NAME in names:
-        return client.get_collection(COLLECTION_NAME)
-    return client.create_collection(COLLECTION_NAME, metadata={"chunks_per_file": 2, "source": "su_orgs_html"})
-
-
-def retrieve_chunks(collection, question: str, k: int):
-    q_vec = openai_client.embeddings.create(
-        model="text-embedding-3-small",
-        input=question
-    ).data[0].embedding
-
-    res = collection.query(
-        query_embeddings=[q_vec],
-        n_results=k,
-        include=["documents", "metadatas"]
-    )
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    return docs, metas
-
-def get_relevant_org_info(query: str, k: int = 4):
-    
-    if not st.session_state.collection:
-        return "", ""
-
-    docs, metas = retrieve_chunks(st.session_state.collection, query, k)
-    
-    relevant_text = "\n\n---\n\n".join(docs) if docs else ""
-
-    src_list = []
-    for md in metas or []:
-        fn = md.get("filename")
-        ch = md.get("chunk")
-        if fn:
-            tag = f"{fn}#chunk{ch}"
-            if tag not in src_list:
-                src_list.append(tag)
-    sources_line = f"Sources: {', '.join(src_list)}" if src_list else ""
-    return relevant_text, sources_line
-
-
-def call_openai(messages):
-    resp = openai_client.chat.completions.create(model="gpt-5", messages=messages)
-    return resp.choices[0].message.content.strip()
-
-def call_gemini(messages):
-    if not GEMINI_KEY:
-        return "[Missing GEMINI_API_KEY]"
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel("gemini-2.5-pro")
-    prompt = "\n".join(m["content"] for m in messages)
-    resp = model.generate_content(prompt)
-    return getattr(resp, "text", "") or "[Empty response]"
-
-def call_mistral(messages):
-    if not MISTRAL_KEY:
-        return "[Missing MISTRAL_API_KEY]"
-    import requests
-    headers = {"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "mistral-small-2506", "messages": messages, "stream": False}
-    r = requests.post("https://api.mistral.ai/v1/chat/completions", headers=headers, json=payload, timeout=60)
-    data = r.json()
-    if "choices" not in data:
-        return f"[Mistral error: {data}]"
-    return data["choices"][0]["message"]["content"].strip()
-
-def ask_model(provider_name: str, messages):
-    if provider_name == "gpt-5":
-        return call_openai(messages)
-    elif provider_name == "Gemini 2.5":
-        return call_gemini(messages)
-    else:
-        return call_mistral(messages)
-
-if "collection" not in st.session_state:
-    st.session_state.collection = None
-
-if st.session_state.collection is None and PERSIST_DIR.exists():
+def recency_score(ymd: str) -> float:
     try:
-        client = chromadb.PersistentClient(path=str(PERSIST_DIR))
-        st.session_state.collection = client.get_collection(COLLECTION_NAME)
+        dt = datetime.strptime(ymd, "%Y-%m-%d")
+        days = max((datetime.utcnow() - dt).days, 0)
+        return math.exp(-days * math.log(2) / 7.0)  # ~7-day half-life
+    except Exception:
+        return 0.5
+
+@dataclass
+class Ranked:
+    id: Any
+    title: str
+    url: str
+    score: float
+    tags: List[str]
+
+def heuristic_rank(items: List[Dict[str, Any]]) -> List[Ranked]:
+    ranked: List[Ranked] = []
+    for it in items:
+        title = it.get("title","")
+        content = it.get("content","")
+        published_at = it.get("published_at","")
+        url = it.get("url","")
+        k = legal_keyword_score(f"{title} {content}")
+        r = recency_score(str(published_at))
+        score = 0.5*r + 0.4*k + 0.1  # simple & auditable
+        tags = []
+        if r >= 0.5: tags.append("recent")
+        if k >= 0.4: tags.append("legal-salient")
+        ranked.append(Ranked(it.get("id"), title, url, round(score,4), tags))
+    ranked.sort(key=lambda x: x.score, reverse=True)
+    return ranked
+
+# ------------------------- Chroma helpers ----------------------
+def get_chroma():
+    os.makedirs(CHROMA_DIR, exist_ok=True)
+    return chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(allow_reset=False))
+
+def build_collection(client: chromadb.PersistentClient, df: pd.DataFrame) -> None:
+    try:
+        client.delete_collection(COLLECTION)
     except Exception:
         pass
+    col = client.get_or_create_collection(COLLECTION, embedding_function=EMBED_FN)
+    docs, ids, metas = [], [], []
+    for _, row in df.iterrows():
+        txt = f"{row['title']}\n\n{row.get('summary','')}\n\n{row.get('content','')}"
+        docs.append(txt)
+        ids.append(str(row["id"]))
+        metas.append({
+            "id": row["id"],
+            "title": row["title"],
+            "url": row["url"],
+            "published_at": row["published_at"],
+            "source": row["source"],
+        })
+    col.add(documents=docs, metadatas=metas, ids=ids)
 
-if st.session_state.collection:
+def load_collection(client: chromadb.PersistentClient):
     try:
-        st.info(f"Collection ready • {st.session_state.collection.count()} chunks")
+        return client.get_collection(COLLECTION, embedding_function=EMBED_FN)
     except Exception:
-        st.info("Collection ready")
-else:
-    st.warning("No Chroma collection found yet. Build it from the HW4 page first.")
+        return None
 
+def retrieve_topic(collection, query: str, k: int) -> List[Dict[str, Any]]:
+    res = collection.query(query_texts=[query], n_results=k, include=["documents","metadatas"])
+    docs = res.get("documents", [[]])[0]
+    metas = res.get("metadatas", [[]])[0]
+    out = []
+    for d, m in zip(docs, metas):
+        out.append({
+            "id": m.get("id"),
+            "title": m.get("title"),
+            "url": m.get("url",""),
+            "published_at": m.get("published_at",""),
+            "source": m.get("source",""),
+            "content": d,
+        })
+    return out
 
-if "chat_log" not in st.session_state:
-    st.session_state.chat_log = []      # full chat UI log
-if "qa_memory" not in st.session_state:
-    st.session_state.qa_memory = []     # Q/A pairs for short-term memory
+def retrieve_broad(collection, k: int) -> List[Dict[str, Any]]:
+    seed = "legal, regulatory, enforcement, litigation, compliance, antitrust, investigation"
+    return retrieve_topic(collection, seed, k=k)
 
-# Render history
-st.subheader("Chat")
-for m in st.session_state.chat_log:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+# -------------------- LLM explain (OpenAI/Gemini) --------------
+def llm_explain(vendor: str, speed: str, rows: List[Ranked], df_map: Dict[Any, Dict[str, Any]]) -> str:
+    if not rows:
+        return "No items to explain."
+    items = []
+    for r in rows[: min(5, len(rows))]:
+        meta = df_map.get(r.id, {})
+        items.append({
+            "title": r.title,
+            "date": meta.get("published_at",""),
+            "source": meta.get("source",""),
+            "url": r.url,
+            "score": r.score,
+            "tags": r.tags,
+        })
+    sys = (
+        "You are a legal-news analyst for a global law firm. "
+        "Briefly explain why these ranked items matter (enforcement/precedent, recency, jurisdiction)."
+    )
+    prompt = f"Items:\n{json.dumps(items, indent=2)}\n\nExplain in 2–3 sentences total."
+    model = MODEL_MAP.get((vendor, speed))
 
-user_q = st.chat_input("Ask about iSchool student organizations…")
-if user_q:
-    st.session_state.chat_log.append({"role": "user", "content": user_q})
-    with st.chat_message("user"):
-        st.markdown(user_q)
+    try:
+        if vendor == "OpenAI":
+            if not OPENAI_KEY:
+                return "[Missing OPENAI_API_KEY]"
+            client = OpenAI(api_key=OPENAI_KEY)
+            resp = client.chat.completions.create(
+                model=model,  # 'gpt-5' or 'gpt-5-nano'
+                messages=[{"role":"system","content": sys},
+                          {"role":"user","content": prompt}],
+            )
+            return resp.choices[0].message.content.strip()
 
-    if not st.session_state.collection:
-        st.error("Please build/load the index on the HW4 page first.")
+        elif vendor == "Gemini":
+            if not GEMINI_KEY:
+                return "[Missing GEMINI_API_KEY]"
+            if genai is None:
+                return "[google-generativeai not installed]"
+            genai.configure(api_key=GEMINI_KEY)
+            gmodel = genai.GenerativeModel(model)  # 'gemini-2.5-pro' or 'gemini-2.5-flash-lite'
+            r = gmodel.generate_content(sys + "\n\n" + prompt)
+            return getattr(r, "text", "") or "[Empty response]"
+
+        return "Explanation disabled."
+    except Exception as e:
+        return f"[LLM error: {e}]"
+
+# ----------------------- Build Index ---------------------------
+st.subheader("1) Build index")
+client = get_chroma()
+if st.button("Build / Rebuild"):
+    with st.spinner("Indexing…"):
+        build_collection(client, df)
+    st.success("Vector index ready.")
+
+collection = load_collection(client)
+if not collection:
+    st.warning("No collection loaded. Click 'Build / Rebuild' first.")
+
+# ----------------------- Ask the bot ---------------------------
+st.subheader("2) Ask")
+mode = st.radio("Choose:", ["Most interesting news", "News about a topic"], horizontal=True)
+topic = ""
+if mode == "News about a topic":
+    topic = st.text_input("Topic (e.g., GDPR, antitrust, mergers)")
+top_k = st.slider("Top-K results", 3, 20, 8, 1)
+
+if st.button("Run"):
+    if not collection:
+        st.error("Please build the index first.")
+        st.stop()
+
+    df_map = {row["id"]: row for _, row in df.iterrows()}
+
+    if mode == "Most interesting news":
+        base = retrieve_broad(collection, k=max(top_k*4, 40))
+        ranked = heuristic_rank(base)[:top_k]
+        st.markdown("### Most Interesting (law-firm lens)")
+        for i, r in enumerate(ranked, 1):
+            meta = df_map.get(r.id, {})
+            st.markdown(
+                f"**{i}. {r.title}** — _{', '.join(r.tags)}_\n\n"
+                f"{meta.get('source','')} · {meta.get('published_at','')}  "
+                + (f"[link]({r.url})" if r.url else "")
+            )
+        with st.expander("Why this order? (LLM)"):
+            st.write(llm_explain(vendor, speed, ranked, df_map))
+
     else:
-        
-        relevant_text, sources_line = get_relevant_org_info(user_q, k=top_k)
+        if not topic.strip():
+            st.warning("Enter a topic.")
+            st.stop()
+        hits = retrieve_topic(collection, topic.strip(), k=top_k)
+        ranked = heuristic_rank(hits)
+        st.markdown(f"### News about **{topic.strip()}**")
+        for i, r in enumerate(ranked, 1):
+            meta = df_map.get(r.id, {})
+            st.markdown(
+                f"**{i}. {r.title}** — _{', '.join(r.tags)}_\n\n"
+                f"{meta.get('source','')} · {meta.get('published_at','')}  "
+                + (f"[link]({r.url})" if r.url else "")
+            )
+        with st.expander("Why these items? (LLM)"):
+            st.write(llm_explain(vendor, speed, ranked, df_map))
 
-        # Build short-term memory block
-        mem_pairs = st.session_state.qa_memory[-memory_turns:] if memory_turns > 0 else []
-        mem_block = ""
-        if mem_pairs:
-            mem_lines = [f"Q: {x['q']}\nA: {x['a']}" for x in mem_pairs]
-            mem_block = "\n\nPrevious Q&A (last {}):\n".format(len(mem_pairs)) + "\n\n".join(mem_lines)
-
-        # HW5: invoke LLM with results of vector search (NOT with raw prompt embeddings)
-        system_msg = (
-            "You are a helpful assistant for Syracuse iSchool student organizations. "
-            "Use ONLY the provided CONTEXT to answer. If it's not in CONTEXT, say you don't know and suggest a related query."
-        )
-
-        context_block = f"CONTEXT:\n{relevant_text or '[no results]'}"
-        if show_sources_inline and sources_line:
-            context_block += f"\n\n{sources_line}"
-
-        # Put memory into the system prompt per HW5 guidance 
-        sys_full = system_msg + (("\n\n" + mem_block) if mem_block else "")
-
-        messages = [
-            {"role": "system", "content": sys_full},
-            {"role": "user", "content": f"{context_block}\n\nUSER QUESTION: {user_q}"},
-        ]
-
-        answer = ask_model(model_choice, messages)
-
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-            with st.expander("Show retrieved context"):
-                st.write(relevant_text if relevant_text else "No context retrieved.")
-                if sources_line:
-                    st.caption(sources_line)
-
-        # Save to chat + memory
-        st.session_state.chat_log.append({"role": "assistant", "content": answer})
-        st.session_state.qa_memory.append({"q": user_q, "a": answer})
-        # keep last N pairs only
-        if memory_turns > 0:
-            st.session_state.qa_memory = st.session_state.qa_memory[-memory_turns:]
-        else:
-            st.session_state.qa_memory = []
+st.caption("Ranking = recency + legal keyword salience. LLM explains; it does not change ordering.")
